@@ -9,51 +9,64 @@ video_path = "AlexThrow1.mp4"
 cap = cv2.VideoCapture(video_path)
 
 
-def angle_3pt(a, b, c):
-    ax, ay = a
-    bx, by = b
-    cx, cy = c
+def angle_3pt(point_a, point_b, point_c):
+    """
+    Computes the angle ABC (in degrees).
+    A, B, C are (x, y) tuples in pixel space.
+    """
+    ax, ay = point_a
+    bx, by = point_b
+    cx, cy = point_c
+
     BA = (ax - bx, ay - by)
-    BC = (cx - bx, ay - by)
+    BC = (cx - bx, cy - by)
 
     dot = BA[0]*BC[0] + BA[1]*BC[1]
-    magBA = math.sqrt(BA[0]**2 + BA[1]**2)
-    magBC = math.sqrt(BC[0]**2 + BC[1]**2)
+    mag_BA = math.sqrt(BA[0]**2 + BA[1]**2)
+    mag_BC = math.sqrt(BC[0]**2 + BC[1]**2)
 
-    if magBA * magBC == 0:
+    if mag_BA * mag_BC == 0:
         return None
 
-    cos_angle = dot / (magBA * magBC)
+    cos_angle = dot / (mag_BA * mag_BC)
     cos_angle = max(min(cos_angle, 1.0), -1.0)
     return math.degrees(math.acos(cos_angle))
 
 
-with mp_pose.Pose(static_image_mode=False,
-                  model_complexity=2,
-                  min_detection_confidence=0.5,
-                  min_tracking_confidence=0.5) as pose:
+with mp_pose.Pose(
+    static_image_mode=False,
+    model_complexity=2,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+) as pose:
 
-    prev_rw = None      # previous RIGHT_WRIST 3D coords (x,y,z)
-    prev_time = None
+    # ==============================
+    # HISTORICAL STATE VARIABLES
+    # ==============================
 
-    # Calibration using REAL SHOULDER WIDTH (meters)
-    SCALE_3D = None
-    REAL_SHOULDER_WIDTH = 0.44   # meters (17.3 inches)
+    prev_wrist_3d = None          # previous RIGHT_WRIST 3D position (x,y,z)
+    prev_timestamp = None         # previous frame timestamp
 
-    # State Machine values
+    # Shoulder calibration (meters per mediapipe-3d-unit)
+    shoulder_scale_3d = None
+    REAL_SHOULDER_WIDTH_M = 0.44  # your real shoulder width in meters
+
+    # Event detection
     reachback_time = None
     power_pocket_time = None
     hit_time = None
 
-    max_reachback_dist = -9999
-    max_forward_vel_mps = -9999
+    max_reachback_distance = -9999
+    peak_arm_speed_mps = -9999
 
-    prev_knee_x = None
+    # Bracing detection
+    previous_knee_x = None
     knee_stop_time = None
-    brace_good = None
+    bracing_good = None
 
-    wrist_buffer = []
-    BUFFER_SIZE = 7
+    # 3D smoothing buffer for wrist
+    wrist_smoothing_buffer = []
+    SMOOTHING_WINDOW = 7
 
 
     while cap.isOpened():
@@ -61,126 +74,155 @@ with mp_pose.Pose(static_image_mode=False,
         if not success:
             break
 
-        # timestamp in seconds
-        t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = pose.process(rgb)
+        # Time in seconds
+        timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb_frame)
 
         if results.pose_landmarks:
-            h, w, _ = frame.shape
+            frame_height, frame_width, _ = frame.shape
 
-            # MAIN KEYPOINTS (3D)
-            ls = results.pose_landmarks.landmark[mp_pose.PoseLandmark.LEFT_SHOULDER]
-            rs = results.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_SHOULDER]
-            re = results.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_ELBOW]
-            rw = results.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_WRIST]
-            rk = results.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_KNEE]
+            # ==============================
+            # EXTRACT KEYPOINTS (3D)
+            # ==============================
 
-            # add current 3D wrist to buffer
-            wrist_buffer.append((rw.x, rw.y, rw.z))
-            if len(wrist_buffer) > BUFFER_SIZE:
-                wrist_buffer.pop(0)
+            left_shoulder  = results.pose_landmarks.landmark[mp_pose.PoseLandmark.LEFT_SHOULDER]
+            right_shoulder = results.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_SHOULDER]
 
-            # smoothed wrist position
-            avg_x = sum(p[0] for p in wrist_buffer) / len(wrist_buffer)
-            avg_y = sum(p[1] for p in wrist_buffer) / len(wrist_buffer)
-            avg_z = sum(p[2] for p in wrist_buffer) / len(wrist_buffer)
+            right_elbow    = results.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_ELBOW]
+            right_wrist    = results.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_WRIST]
 
+            right_knee     = results.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_KNEE]
 
-            # pixel coords (for drawing & angles)
-            s = (rs.x * w, rs.y * h)
-            e = (re.x * w, re.y * h)
-            r = (rw.x * w, rw.y * h)
-            knee = (rk.x * w, rk.y * h)
+            # ==============================
+            # SMOOTH THE 3D WRIST POSITION
+            # ==============================
 
-            # -------------------------
-            # 1) ONE-TIME 3D SHOULDER CALIBRATION
-            # -------------------------
-            if SCALE_3D is None:
-                dx = ls.x - rs.x
-                dy = ls.y - rs.y
-                dz = ls.z - rs.z     # MediaPipe z is proportional to x units
+            wrist_smoothing_buffer.append((right_wrist.x, right_wrist.y, right_wrist.z))
 
-                shoulder_3d = math.sqrt(dx*dx + dy*dy + dz*dz)
+            if len(wrist_smoothing_buffer) > SMOOTHING_WINDOW:
+                wrist_smoothing_buffer.pop(0)
 
-                if shoulder_3d > 0:
-                    SCALE_3D = REAL_SHOULDER_WIDTH / shoulder_3d
-                    print(f"[3D Calibration] shoulder_3d={shoulder_3d:.5f}, SCALE_3D={SCALE_3D:.5f} meters/unit")
+            smoothed_wrist_x = sum(p[0] for p in wrist_smoothing_buffer) / len(wrist_smoothing_buffer)
+            smoothed_wrist_y = sum(p[1] for p in wrist_smoothing_buffer) / len(wrist_smoothing_buffer)
+            smoothed_wrist_z = sum(p[2] for p in wrist_smoothing_buffer) / len(wrist_smoothing_buffer)
 
-            # -------------------------
-            # 2) 3D WRIST VELOCITY
-            # -------------------------
+            smoothed_wrist_3d = (smoothed_wrist_x, smoothed_wrist_y, smoothed_wrist_z)
+
+            # ==============================
+            # PIXEL COORDS FOR ANGLES
+            # ==============================
+
+            shoulder_px     = (right_shoulder.x * frame_width, right_shoulder.y * frame_height)
+            elbow_px        = (right_elbow.x    * frame_width, right_elbow.y    * frame_height)
+            wrist_px        = (right_wrist.x    * frame_width, right_wrist.y    * frame_height)
+            knee_px         = (right_knee.x     * frame_width, right_knee.y     * frame_height)
+
+            # ==============================
+            # 3D SHOULDER WIDTH CALIBRATION
+            # ==============================
+
+            if shoulder_scale_3d is None:
+                dx = left_shoulder.x - right_shoulder.x
+                dy = left_shoulder.y - right_shoulder.y
+                dz = left_shoulder.z - right_shoulder.z
+
+                shoulder_distance_3d = math.sqrt(dx*dx + dy*dy + dz*dz)
+
+                if shoulder_distance_3d > 0:
+                    shoulder_scale_3d = REAL_SHOULDER_WIDTH_M / shoulder_distance_3d
+                    print(f"[Calibration] scale = {shoulder_scale_3d:.6f} m/unit")
+
+            # ==============================
+            # COMPUTE 3D WRIST VELOCITY
+            # ==============================
+
             wrist_velocity_3d = None
-            if prev_rw is not None:
-                dt = t - prev_time
+
+            if prev_wrist_3d is not None and prev_timestamp is not None:
+                dt = timestamp - prev_timestamp
                 if dt > 0:
-                    dx3 = rw.x - prev_rw.x
-                    dy3 = rw.y - prev_rw.y
-                    dz3 = rw.z - prev_rw.z
+                    dx = smoothed_wrist_x - prev_wrist_3d[0]
+                    dy = smoothed_wrist_y - prev_wrist_3d[1]
+                    dz = smoothed_wrist_z - prev_wrist_3d[2]
 
-                    wrist_velocity_3d = math.sqrt(dx3*dx3 + dy3*dy3 + dz3*dz3) / dt
+                    raw_velocity = math.sqrt(dx*dx + dy*dy + dz*dz) / dt
 
-            # Convert to real-world meters/sec and mph
-            if wrist_velocity_3d is not None and SCALE_3D is not None:
-                mps = wrist_velocity_3d * SCALE_3D
-                mph = mps * 2.23694
+                    # Spike suppression
+                    if raw_velocity > 0.12:
+                        raw_velocity *= 0.5
 
-                if mps > max_forward_vel_mps:
-                    max_forward_vel_mps = mps
-                    hit_time = t
+                    if shoulder_scale_3d is not None:
+                        wrist_velocity_3d = raw_velocity * shoulder_scale_3d
 
-            # -------------------------
-            # 3) Reachback Detection
-            # -------------------------
-            backward_dist = s[0] - r[0]
-            if backward_dist > max_reachback_dist:
-                max_reachback_dist = backward_dist
-                reachback_time = t
+                        if wrist_velocity_3d > peak_arm_speed_mps:
+                            peak_arm_speed_mps = wrist_velocity_3d
+                            hit_time = timestamp
 
-            # -------------------------
-            # 4) Power Pocket Detection
-            # -------------------------
-            elbow_angle = angle_3pt(s, e, r)
+            # ==============================
+            # REACHBACK DETECTION
+            # (Wrist farthest behind shoulder horizontally)
+            # ==============================
+
+            wrist_behind_distance = shoulder_px[0] - wrist_px[0]
+
+            if wrist_behind_distance > max_reachback_distance:
+                max_reachback_distance = wrist_behind_distance
+                reachback_time = timestamp
+
+            # ==============================
+            # POWER POCKET DETECTION
+            # ==============================
+
+            elbow_angle_deg = angle_3pt(shoulder_px, elbow_px, wrist_px)
+
             if power_pocket_time is None:
-                if elbow_angle is not None and elbow_angle < 100 and r[0] > e[0]:
-                    power_pocket_time = t
+                if elbow_angle_deg is not None and elbow_angle_deg < 100 and wrist_px[0] > elbow_px[0]:
+                    power_pocket_time = timestamp
 
-            # -------------------------
-            # 5) Bracing Detection
-            # -------------------------
-            if prev_knee_x is not None:
-                if abs(knee[0] - prev_knee_x) < 0.5 and knee_stop_time is None:
-                    knee_stop_time = t
+            # ==============================
+            # BRACING DETECTION
+            # (Knee stops before hit)
+            # ==============================
 
-            if knee_stop_time is not None and hit_time is not None and brace_good is None:
-                brace_good = knee_stop_time < hit_time
+            if previous_knee_x is not None:
+                if abs(knee_px[0] - previous_knee_x) < 0.5 and knee_stop_time is None:
+                    knee_stop_time = timestamp
 
-            prev_knee_x = knee[0]
+            if knee_stop_time and hit_time and bracing_good is None:
+                bracing_good = knee_stop_time < hit_time
 
-            prev_rw = rw
-            prev_time = t
+            previous_knee_x = knee_px[0]
 
-            mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+            # Save previous frame values
+            prev_wrist_3d = smoothed_wrist_3d
+            prev_timestamp = timestamp
 
-        cv2.imshow("Disc Golf Analyzer (3D Corrected)", frame)
+            mp_drawing.draw_landmarks(
+                frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS
+            )
+
+        cv2.imshow("Disc Golf Analyzer (3D Smoothed + Clean Names)", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    # -------------------------
-    # FINAL SUMMARY
-    # -------------------------
-    print("\n=========================")
+    # ==============================
+    # OUTPUT RESULTS
+    # ==============================
+
+    print("\n==========================")
     print("     THROW BREAKDOWN")
-    print("=========================")
+    print("==========================")
     print(f"Reach-Back Time       : {reachback_time:.3f} sec")
     print(f"Power Pocket Time     : {power_pocket_time:.3f} sec")
-    print(f"Hit Time (max speed)  : {hit_time:.3f} sec")
-    print(f"Peak Arm Speed        : {max_forward_vel_mps*2.23694:.2f} mph")
+    print(f"Hit Time              : {hit_time:.3f} sec")
+    print(f"Peak Arm Speed        : {peak_arm_speed_mps*2.23694:.2f} mph")
 
-    if brace_good is None:
+    if bracing_good is None:
         print("Bracing               : Undetermined")
     else:
-        print("Bracing               :", "GOOD" if brace_good else "LATE")
+        print("Bracing               :", "GOOD" if bracing_good else "LATE")
 
     cap.release()
     cv2.destroyAllWindows()
